@@ -1,5 +1,5 @@
 #include <vitasdk.h>
-#include <libk/stdio.h>
+#include <stdio.h>
 
 /*
  * This plugin uses a slight modified version of libjpeg-turbo 1.5.1:

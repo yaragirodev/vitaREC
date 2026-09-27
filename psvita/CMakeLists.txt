@@ -8,7 +8,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(VITA2PC)
+project(VITA2PC C)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -std=gnu99 -DTAIPOOL_AS_STDLIB")
@@ -39,7 +39,6 @@ target_link_libraries(VITA2PC
   SceDisplay_stub_weak
   SceSysmem_stub_weak
   jpeg
-  k
   gcc
   SceNet_stub_weak
   SceNetCtl_stub_weak
@@ -49,6 +48,26 @@ target_link_libraries(VITA2PC
   SceJpegEnc_stub_weak
   SceAppMgr_stub_weak
   SceCtrl_stub_weak
+  SceRtc_stub_weak
+  -l:libsupc++.a
+  -l:libc.a
+  -l:libm.a
+  # runtime refs the kernel syscalls again (link order)
+  SceProcessmgr_stub_weak
+  SceIofilemgr_stub_weak
+  SceLibKernel_stub_weak
+  SceSysmodule_stub_weak
+  ScePower_stub_weak
+  SceAppMgr_stub_weak
+  SceCtrl_stub_weak
+  SceRtc_stub_weak
+  SceNet_stub_weak
+  SceNetCtl_stub_weak
+  SceDisplay_stub_weak
+  SceSysmem_stub_weak
+  SceJpegEnc_stub_weak
+  SceKernelThreadMgr_stub
+  gcc
 )
 
 set_target_properties(VITA2PC

@@ -1,34 +1,23 @@
-TARGET := VITA2PC
-SOURCES := source
-BUILD	:= build
+# VITA2REC PC-side AVI recorder
+CC      ?= cc
+CFLAGS  ?= -O2 -Wall -Wextra
+LDFLAGS ?=
 
-LIBS := -lOpenAL32 -lopengl32 -lSDL -lSDL_image -lSDL_mixer -lpsapi -lws2_32 -lstdc++
+ifeq ($(OS),Windows_NT)
+  CC  := x86_64-w64-mingw32-gcc
+  LD  := -lws2_32 -lwinmm
+else
+  LD  :=
+endif
 
-CFLAGS := -fpermissive -DNO_STDIO_REDIRECT -Dmain=SDL_main
-LFLAGS :=
-LDARGS := -DNO_STDIO_REDIRECT -Dmain=SDL_main
+TARGET := vita-recorder
+TARGET := $(if $(findstring Windows_NT,$(OS)),$(TARGET).exe,$(TARGET))
 
-C_FILES	:= $(shell find $(SOURCES) -type f -name '*.c')
-CPP_FILES	:= $(shell find $(SOURCES) -type f -name '*.cpp')
-OBJ_FILES := $(patsubst %.c,%.o,$(C_FILES)) $(patsubst %.cpp,%.o,$(CPP_FILES))
-CC = $(GCC_PREFIX)gcc
-CXX = $(GCC_PREFIX)g++
-LD = $(GCC_PREFIX)g++
+$(TARGET): recorder.c
+	$(CC) $(CFLAGS) -o $@ recorder.c $(LD)
 
-all: $(TARGET).exe
+windows:
+	$(MAKE) CC=x86_64-w64-mingw32-gcc
 
-$(TARGET).exe: $(OBJ_FILES)
-	@echo Creating icon resource file...
-	@windres source/icon.rc -O coff -o icon.res
-	@echo Linking object files...
-	$(LD) -o $@ $(LDARGS) $^ icon.res $(LIBS)
-
-%.o: %.c
-	@echo Creating object file $@...
-	$(CXX) $(CFLAGS) -c $< -o $@
-	
 clean:
-	@echo Cleaning...
-	@rm -f $(OBJ_FILES)
-	@rm -f icon.res
-	@rm -f *.exe
+	rm -f $(TARGET) *.o

@@ -1,8 +1,9 @@
 #include <vitasdk.h>
 #include <taihen.h>
 #include <taipool.h>
-#include <libk/stdlib.h>
-#include <libk/stdio.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "renderer.h"
 #include "encoder.h"
 #include "rescaler.h"
@@ -10,6 +11,7 @@
 #define HOOKS_NUM       10
 #define MENU_ENTRIES    8
 #define QUALITY_ENTRIES 5
+#define CAPTURE_ENTRIES 3
 
 #define VIDEO_PORT     5000    // Port used for screen streaming
 #define AUDIO_PORT     4000    // Starting port used for audio streaming
@@ -25,6 +27,11 @@
 
 #define NO_DEBUG
 
+// newlib crt/exit stubs (we link with -nostdlib, no crt0)
+void _init(void) {}
+void _fini(void) {}
+void _free_vita_newlib(void) {}
+
 // Audioports struct
 typedef struct audioPort{
 	int len;
@@ -39,30 +46,35 @@ static char vita_ip[32];
 static uint64_t vita_addr;
 static int stream_skt = -1;
 static int audio_skt[AUDIO_CHANNELS];
+// TCP recording related
+static int tcp_skt = -1;
+static SceNetSockaddrIn tcp_addrTo;
+static uint8_t use_tcp = 0;
 
 // Hooks related variables
-static SceUID g_hooks[HOOKS_NUM], stream_thread_id, async_mutex;
+static SceUID g_hooks[HOOKS_NUM], stream_thread_id, async_run, async_frame_sema;
 static tai_hook_ref_t ref[HOOKS_NUM];
 static uint8_t cur_hook = 0;
 
 // Status related variables
 static SceUID isEncoderUnavailable = 0;
 static SceUID isNetAvailable = 1;
-static SceUID firstBoot = 1;
+static uint8_t backend_ready = 0;
 static uint8_t audioEnabled = 1;
 static uint8_t videoEnabled = 1;
 static uint8_t status = NOT_TRIGGERED;
 static int cfg_i = 0;
 static int qual_i = 2;
 static uint8_t skip_net_init = 0;
-static uint8_t delayed_net_init = 0;
 
 // Video streaming related variables
 static uint8_t video_quality = 255;
 static encoder jpeg_encoder;
-static uint8_t frameskip = 0;
-static uint8_t stream_type = 1;
+static uint8_t capture_i = 0;      // 0=All frames, 1=1/4, 2=1/8
+static uint8_t stream_type = 0;    // 0=Synchronous (recommended for recording), 1=Asynchronous
 static uint8_t* mem;
+static SceDisplayFrameBuf async_frame;
+static uint8_t async_have_frame = 0;
 static uint32_t* rescale_buffer = NULL;
 static uint8_t enforce_sw = 0;
 
@@ -73,7 +85,9 @@ static uint32_t old_buttons;
 // Menu related variables
 static char* qualities[] = {"Best", "High", "Default", "Low", "Worst"};
 static uint8_t qual_val[] = {0, 64, 128, 192, 255};
-static char* menu[] = {"Video Quality: ", "Video Streaming: ", "Hardware Acceleration: ", "Downscaler: ","Frame Skip: ", "Stream Type: ", "Audio Streaming: ", "Start Screen Streaming"};
+static char* capture_rates[] = {"All", "1/4", "1/8"};
+static uint8_t capture_period[] = {0, 4, 8};
+static char* menu[] = {"Video Quality: ", "Video Streaming: ", "Hardware Acceleration: ", "Downscaler: ", "Capture Rate: ", "Stream Type: ", "Audio Streaming: ", "Start Recording"};
 
 // Generic variables
 static uint32_t mempool_size = 0x500000;
@@ -121,7 +135,7 @@ void drawConfigMenu(){
 				drawStringF(5, 80 + i*20, "%s%s", menu[i], (jpeg_encoder.rescale_buffer != NULL) ? "Enabled" : "Disabled");
 				break;
 			case 4:
-				drawStringF(5, 80 + i*20, "%s%u", menu[i], frameskip);
+				drawStringF(5, 80 + i*20, "%s%s", menu[i], capture_rates[capture_i]);
 				break;
 			case 5:
 				drawStringF(5, 80 + i*20, "%s%s", menu[i], stream_type ? "Asynchronous" : "Synchronous");
@@ -130,7 +144,7 @@ void drawConfigMenu(){
 				drawStringF(5, 80 + i*20, "%s%s", menu[i], audioEnabled ? "Enabled" : "Disabled");
 				break;
 			default:
-				drawString(5, 80 + i*20, menu[i]);
+				drawString(5, 80 + i*20, (status >= SYNC_BROADCAST) ? "Stop Recording" : menu[i]);
 				break;
 		}
 	}
@@ -143,19 +157,75 @@ void hookFunction(uint32_t nid, const void* func){
 	cur_hook++;
 }
 
+// Current time in microseconds (SceRtc epoch)
+static uint64_t rtcUs(void){
+	SceRtcTick tick;
+	sceRtcGetCurrentTick(&tick);
+	return (uint64_t)tick.tick;
+}
+
+// Send all bytes over TCP (handles partial sends)
+static void tcpSendAll(int skt, const void* data, int size){
+	int off = 0;
+	while (off < size){
+		int n = sceNetSend(skt, (const char*)data + off, size - off, 0);
+		if (n <= 0) return;
+		off += n;
+	}
+}
+
+// Send one video frame.
+// TCP (recording) wire format: u32le jpeg_size | u64le timestamp_us | jpeg bytes
+// UDP (legacy live streaming): raw jpeg datagram
+static void sendVideoFrame(const uint8_t* data, uint32_t size){
+	if (use_tcp){
+		uint8_t hdr[12];
+		uint64_t ts = rtcUs();
+		int i;
+		if (tcp_skt < 0) return;
+		for (i = 0; i < 4; i++) hdr[i]   = (uint8_t)((size >> (8*i)) & 0xFF);
+		for (i = 0; i < 8; i++) hdr[4+i] = (uint8_t)((ts   >> (8*i)) & 0xFF);
+		tcpSendAll(tcp_skt, hdr, 12);
+		tcpSendAll(tcp_skt, data, (int)size);
+	}else{
+		sceNetSendto(stream_skt, data, size, 0, (SceNetSockaddr*)&addrFrom, sizeof(addrFrom));
+	}
+}
+
+// Should the current SetFrameBuf call be captured?
+static int shouldCapture(void){
+	uint8_t period = capture_period[capture_i];
+	if (period == 0) return 1;              // capture every call
+	return loopDrawing == (int)period - 1;
+}
+
 // Asynchronous video streaming thread
 int stream_thread(SceSize args, void *argp){
 	int mem_size;
-	SceDisplayFrameBuf param;
-	param.size = sizeof(SceDisplayFrameBuf);
-	sceKernelWaitSema(async_mutex, 1, NULL);
 	for (;;){
-		sceDisplayGetFrameBuf(&param, SCE_DISPLAY_SETBUF_NEXTFRAME);
-		if (rescale_buffer != NULL){ // Downscaler available
-			rescaleBuffer((uint32_t*)param.base, rescale_buffer, param.pitch, param.width, param.height);
-			mem = encodeARGB(&jpeg_encoder, rescale_buffer, 512, &mem_size);
-		}else mem = encodeARGB(&jpeg_encoder, param.base, param.pitch, &mem_size);
-		sceNetSendto(stream_skt, mem, mem_size, 0, (SceNetSockaddr*)&addrFrom, sizeof(addrFrom));
+		// wait for "start" (initial count 1 = first pass, then it blocks)
+		sceKernelWaitSema(async_run, 1, NULL);
+		if (status != ASYNC_BROADCAST) continue;
+		// run until stopped
+		for (;;){
+			if (status != ASYNC_BROADCAST) break;
+			// wait for a frame handed off by the SetFrameBuf hook (200 ms tick)
+			SceUInt tw = 200000;
+			sceKernelWaitSema(async_frame_sema, 1, &tw);
+			if (status != ASYNC_BROADCAST) break;
+			if (!async_have_frame) continue;
+			async_have_frame = 0;
+			if (!videoEnabled) continue;
+			SceDisplayFrameBuf param = async_frame;
+			if (rescale_buffer != NULL){ // Downscaler available
+				rescaleBuffer((uint32_t*)param.base, rescale_buffer, param.pitch, param.width, param.height);
+				mem = encodeARGB(&jpeg_encoder, rescale_buffer, 512, &mem_size);
+			}else mem = encodeARGB(&jpeg_encoder, param.base, param.pitch, &mem_size);
+			sendVideoFrame((const uint8_t*)mem, (uint32_t)mem_size);
+		}
+		// drop a stale frame left in the slot, if any
+		SceUInt t0 = 0;
+		if (sceKernelWaitSema(async_frame_sema, 1, &t0) == 0) async_have_frame = 0;
 	}
 	return 0;
 }
@@ -179,6 +249,67 @@ int scePowerSetGpuXbarClockFrequency_patched(int freq) {
 
 int scePowerSetArmClockFrequency_patched(int freq) {
 	return SetGenericClockFrequency(444, ref[3]);
+}
+
+// Stop streaming and release all sockets (called from the config menu)
+static void stopStreaming(void){
+	if (tcp_skt >= 0){ sceNetSocketClose(tcp_skt); tcp_skt = -1; }
+	if (stream_skt >= 0){ sceNetSocketClose(stream_skt); stream_skt = -1; }
+	int i;
+	for (i = 0; i < AUDIO_CHANNELS; i++){
+		if (audio_skt[i] >= 0){ sceNetSocketClose(audio_skt[i]); audio_skt[i] = -1; }
+	}
+	use_tcp = 0;
+}
+
+// One-time backend init (encoder + network + clock pinning).
+// Deliberately NOT done at module_start: heavy allocations and sysmodule
+// loads inside the game's first frames crash some titles on modern firmware.
+// Triggered by the user pressing L+Select (open menu).
+static void initBackend(void){
+	SceDisplayFrameBuf param;
+	if (backend_ready) return;
+	param.size = sizeof(SceDisplayFrameBuf);
+	sceDisplayGetFrameBuf(&param, SCE_DISPLAY_SETBUF_NEXTFRAME);
+
+	// Pin clocks for the session (user action time, not load time)
+	scePowerSetArmClockFrequency(444);
+	scePowerSetBusClockFrequency(222);
+	scePowerSetGpuClockFrequency(222);
+	scePowerSetGpuXbarClockFrequency(166);
+
+	setTextColor(0x00FFFFFF);
+	isEncoderUnavailable = encoderInit(param.width, param.height, param.pitch, &jpeg_encoder, video_quality, enforce_sw, 0);
+	rescale_buffer = (uint32_t*)jpeg_encoder.rescale_buffer;
+
+	if ((!isEncoderUnavailable) && (!skip_net_init)){
+		isNetAvailable = (SceUID)malloc(NET_SIZE);
+		if (isNetAvailable){
+			sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+			int ret = sceNetShowNetstat();
+			if (ret == SCE_NET_ERROR_ENOTINIT) {
+				SceNetInitParam initparam;
+				initparam.memory = (void*)isNetAvailable;
+				initparam.size = NET_SIZE;
+				initparam.flags = 0;
+				sceNetInit(&initparam);
+			}
+			sceNetCtlInit();
+			SceNetCtlInfo info;
+			sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info);
+			sprintf(vita_ip,"%s",info.ip_address);
+			sceNetInetPton(SCE_NET_AF_INET, info.ip_address, &vita_addr);
+		}
+	}
+	if (skip_net_init){
+		sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+		sceNetCtlInit();
+		SceNetCtlInfo info;
+		sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info);
+		sprintf(vita_ip,"%s",info.ip_address);
+		sceNetInetPton(SCE_NET_AF_INET, info.ip_address, &vita_addr);
+	}
+	backend_ready = 1;
 }
 
 // Checking buttons startup/closeup
@@ -207,7 +338,7 @@ void checkInput(SceCtrlData *ctrl){
 					rescale_buffer = jpeg_encoder.rescale_buffer;
 					break;
 				case 4:
-					frameskip = (frameskip + 1) % 5;
+					capture_i = (capture_i + 1) % CAPTURE_ENTRIES;
 					break;
 				case 5:
 					stream_type = (stream_type + 1) % 2;
@@ -217,38 +348,23 @@ void checkInput(SceCtrlData *ctrl){
 					break;
 				case 7:
 					encoderSetQuality(&jpeg_encoder, qual_val[qual_i]);
-					status = LISTENING;
+					if (status >= SYNC_BROADCAST){
+						stopStreaming();
+						status = NOT_TRIGGERED;
+					}else{
+						status = LISTENING;
+					}
 					break;
 				default:
 					break;
 			}
 		}else if ((ctrl->buttons & SCE_CTRL_TRIANGLE) && (!(old_buttons & SCE_CTRL_TRIANGLE))){
+			stopStreaming();
 			status = NOT_TRIGGERED;
 		}
 	}else if ((ctrl->buttons & SCE_CTRL_LTRIGGER) && (ctrl->buttons & SCE_CTRL_SELECT)){
+		initBackend();
 		status = CONFIG_MENU;
-		if (delayed_net_init){
-			isNetAvailable = (SceUID)malloc(NET_SIZE);
-			if (isNetAvailable){
-				sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-				int ret = sceNetShowNetstat();
-				if (ret != SCE_NET_ERROR_ENOTINIT) sceNetTerm();
-				SceNetInitParam initparam;
-				initparam.memory = (void*)isNetAvailable;
-				initparam.size = NET_SIZE;
-				initparam.flags = 0;
-				sceNetInit(&initparam);
-			}
-			delayed_net_init = 0;
-		}
-		if (skip_net_init){
-			sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-			sceNetCtlInit();
-			SceNetCtlInfo info;
-			sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info);
-			sprintf(vita_ip,"%s",info.ip_address);
-			sceNetInetPton(SCE_NET_AF_INET, info.ip_address, &vita_addr);
-		}
 	}
 	old_buttons = ctrl->buttons;
 }
@@ -256,49 +372,27 @@ void checkInput(SceCtrlData *ctrl){
 // This can be considered as our main loop
 int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
 	
-	if (firstBoot){
-		firstBoot = 0;
-		
-		// Initializing internal renderer
-		setTextColor(0x00FFFFFF);
-		
-		// Initializing JPG encoder
-		isEncoderUnavailable = encoderInit(pParam->width, pParam->height, pParam->pitch, &jpeg_encoder, video_quality, enforce_sw, 0);
-		rescale_buffer = (uint32_t*)jpeg_encoder.rescale_buffer;
-		
-		// Initializing Net if encoder is ready
-		if ((!isEncoderUnavailable) && (!skip_net_init)){
-			isNetAvailable = (SceUID)malloc(NET_SIZE);
-			if (isNetAvailable){
-				sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-				int ret = sceNetShowNetstat();
-				if (ret == SCE_NET_ERROR_ENOTINIT) {
-					SceNetInitParam initparam;
-					initparam.memory = (void*)isNetAvailable;
-					initparam.size = NET_SIZE;
-					initparam.flags = 0;
-					sceNetInit(&initparam);
-				}
-				sceNetCtlInit();
-				SceNetCtlInfo info;
-				sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_IP_ADDRESS, &info);
-				sprintf(vita_ip,"%s",info.ip_address);
-				sceNetInetPton(SCE_NET_AF_INET, info.ip_address, &vita_addr);
-			}
-		}
-		
-	}
-	
+	// Intentionally light: no allocations, no sysmodule loads, no encoder.
+	// Heavy init happens in initBackend() when the user opens the menu.
 	updateFramebuf(pParam);
 	SceCtrlData pad;
 	sceCtrlPeekBufferPositive(0, &pad, 1);
 	checkInput(&pad);
 	
+	// Async mode: hand this presented frame to the encoder thread.
+	// At most one frame is queued, so under load frames are dropped
+	// (correct real-time pacing, no game-thread stall).
+	if (status == ASYNC_BROADCAST && !async_have_frame){
+		async_frame = *pParam;
+		async_have_frame = 1;
+		sceKernelSignalSema(async_frame_sema, 1);
+	}
+	
 	if (status == NOT_TRIGGERED){
 		if (isEncoderUnavailable) drawStringF(5,5, "ERROR: encoderInit -> 0x%X", isEncoderUnavailable);
 		else if ((!isNetAvailable) && (!skip_net_init)) drawString(5,5, "ERROR: malloc(NET_SIZE) -> NULL");
-	}else if ((!isEncoderUnavailable) && (isNetAvailable || skip_net_init)){
-		char txt[32], unused[16];
+		}else if ((!isEncoderUnavailable) && (isNetAvailable || skip_net_init)){
+		char txt[48], req[64];
 		int sndbuf_size = STREAM_BUFSIZE;
 		int mem_size;
 		unsigned int fromLen = sizeof(addrFrom);
@@ -306,7 +400,7 @@ int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
 			case CONFIG_MENU:
 				drawStringF(5,5, "IP: %s", vita_ip);
 				drawStringF(5,25, "Title ID: %s", titleid);
-				drawString(5, 50, "VITA2PC v.0.3 Experimental - CONFIG MENU");
+				drawString(5, 50, "VITA-REC v1.0 - CONFIG MENU");
 				drawStringF(5, 250, "Resolution: %d x %d", pParam->width, pParam->height);
 				drawConfigMenu();
 				break;
@@ -318,23 +412,71 @@ int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
 					addrTo.sin_addr.s_addr = vita_addr;
 					sceNetBind(stream_skt, (SceNetSockaddr*)&addrTo, sizeof(addrTo));
 					sceNetSetsockopt(stream_skt, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+						int rto = 1;
+						sceNetSetsockopt(stream_skt, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &rto, sizeof(rto));
 				}
-				sceNetRecvfrom(stream_skt, unused, 8, 0, (SceNetSockaddr*)&addrFrom, &fromLen);
-				sprintf(txt, "%d;%d;%hhu", (jpeg_encoder.rescale_buffer != NULL) ? 480 : pParam->width, (jpeg_encoder.rescale_buffer != NULL) ? 272 : pParam->height, jpeg_encoder.isHwAccelerated);
-				sceNetSendto(stream_skt, txt, 32, 0, (SceNetSockaddr*)&addrFrom, sizeof(addrFrom));
+				// Wait for the PC client. It re-sends "V2R;<tcpport>" every 2 s
+				// (recording over TCP) or the legacy "request" (raw UDP streaming).
+				req[0] = 0;
+				req[63] = 0;
+				int rn = sceNetRecvfrom(stream_skt, req, 63, 0, (SceNetSockaddr*)&addrFrom, &fromLen);
+				if (rn > 0 && req[0]){
+				use_tcp = 0;
+				if (strncmp(req, "V2R;", 4) == 0) use_tcp = 1;
+				
+				if (use_tcp && (tcp_skt < 0)){
+					uint16_t pc_port = (uint16_t)atoi(req + 4);
+					int timeout = 10; // seconds
+					uint8_t hdr[24];
+					int i;
+					tcp_skt = sceNetSocket("V2R TCP", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, SCE_NET_IPPROTO_TCP);
+					if (tcp_skt >= 0){
+						sceNetSetsockopt(tcp_skt, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &timeout, sizeof(timeout));
+						tcp_addrTo.sin_family = SCE_NET_AF_INET;
+						tcp_addrTo.sin_port = sceNetHtons(pc_port);
+						tcp_addrTo.sin_addr.s_addr = addrFrom.sin_addr.s_addr;
+						if (sceNetConnect(tcp_skt, (SceNetSockaddr*)&tcp_addrTo, sizeof(tcp_addrTo)) == 0){
+							uint32_t w = (jpeg_encoder.rescale_buffer != NULL) ? 480 : pParam->width;
+							uint32_t h = (jpeg_encoder.rescale_buffer != NULL) ? 272 : pParam->height;
+							hdr[0] = 'V'; hdr[1] = '2'; hdr[2] = 'R'; hdr[3] = '1';
+							for (i = 0; i < 4; i++) hdr[4+i]  = (uint8_t)(1 >> (8*i));             // version
+							for (i = 0; i < 4; i++) hdr[8+i]  = (uint8_t)(w >> (8*i));
+							for (i = 0; i < 4; i++) hdr[12+i] = (uint8_t)(h >> (8*i));
+							for (i = 0; i < 4; i++) hdr[16+i] = (uint8_t)(jpeg_encoder.isHwAccelerated >> (8*i));
+							for (i = 0; i < 4; i++) hdr[20+i] = 0;                                // reserved
+							tcpSendAll(tcp_skt, hdr, 24);
+						}else{
+							sceNetSocketClose(tcp_skt);
+							tcp_skt = -1;
+						/* keep use_tcp = 1: stay in LISTENING, the PC recorder re-sends its request */
+						}
+					}
+				}
+				
+				if (tcp_skt >= 0 || !use_tcp){
+				sprintf(txt, "%d;%d;%hhu;%d", (jpeg_encoder.rescale_buffer != NULL) ? 480 : pParam->width, (jpeg_encoder.rescale_buffer != NULL) ? 272 : pParam->height, jpeg_encoder.isHwAccelerated, use_tcp);
+				sceNetSendto(stream_skt, txt, strlen(txt), 0, (SceNetSockaddr*)&addrFrom, sizeof(addrFrom));
 				status = SYNC_BROADCAST + stream_type;
 				
 				// Sending request to secondary thread
-				if ((status == ASYNC_BROADCAST) && videoEnabled) sceKernelSignalSema(async_mutex, 1);
+				if (status == ASYNC_BROADCAST) sceKernelSignalSema(async_run, 1);
 				
 				break;
+				}
+			/* No request yet (recv timeout) or TCP connect failed: keep waiting */
+			}
+			// Waiting overlay - the game keeps running in the background
+			drawString(5, 5, "VITA-REC: Waiting for PC connection...");
+			drawStringF(5, 25, "IP: %s", vita_ip);
+			drawString(5, 45, "On PC:  vita-recorder --vita <IP>");
+			break;
 			case SYNC_BROADCAST:
-				if (loopDrawing == (3 + frameskip)){				
+				if (shouldCapture()){
 					if (rescale_buffer != NULL){ // Downscaler available
 						rescaleBuffer((uint32_t*)pParam->base, rescale_buffer, pParam->pitch, pParam->width, pParam->height);
 						mem = encodeARGB(&jpeg_encoder, rescale_buffer, 512, &mem_size);
 					}else mem = encodeARGB(&jpeg_encoder, pParam->base, pParam->pitch, &mem_size);
-					sceNetSendto(stream_skt, mem, mem_size, 0, (SceNetSockaddr*)&addrFrom, sizeof(addrFrom));
+					sendVideoFrame((const uint8_t*)mem, (uint32_t)mem_size);
 					loopDrawing = 0;
 				}else loopDrawing++;
 				break;
@@ -359,7 +501,9 @@ int scePowerSetUsingWireless_patched(int enable) {
 }
 
 int scePowerSetConfigurationMode_patched(int mode) {
-	return 0;
+	/* pass through (swallowing it can break the XMB under *ALL);
+       clocks stay pinned by the four clock hooks anyway */
+	return TAI_CONTINUE(int, ref[6], mode);
 }
 
 int sceAudioOutOpenPort_patched(int type, int len, int freq, int mode) {
@@ -400,11 +544,9 @@ int sceAudioOutReleasePort_patched(int port) {
 void _start() __attribute__ ((weak, alias ("module_start")));
 int module_start(SceSize argc, const void *args) {
 	
-	// Setting maximum clocks
-	scePowerSetArmClockFrequency(444);
-	scePowerSetBusClockFrequency(222);
-	scePowerSetGpuClockFrequency(222);
-	scePowerSetGpuXbarClockFrequency(166);
+	// NOTE: no clock pinning / encoder / network init here on purpose —
+	// all of it is deferred to initBackend() (user opens the menu),
+	// because doing it at load time crashes some games on 10.90/20.93.
 	
 	// Checking if game is blacklisted
 	sceAppMgrAppParamGetString(0, 12, titleid , 256);	
@@ -414,7 +556,6 @@ int module_start(SceSize argc, const void *args) {
 	}else if (strncmp(titleid, "PCSB00074", 9) == 0){ // Assassin's Creed III: Liberation (EUR)
 		mempool_size = 0x200000;
 		skip_net_init = 1;
-		delayed_net_init = 1;
 	}else if (strncmp(titleid, "PCSF00178", 9) == 0){ // Soul Sacrifice (EUR)
 		mempool_size = 0x200000;
 	}else if (strncmp(titleid, "PCSF00024", 9) == 0){ // Gravity Rush (EUR)
@@ -428,7 +569,6 @@ int module_start(SceSize argc, const void *args) {
 	}else if (strncmp(titleid, "PCSF00217", 9) == 0){ // Smart As... (EUR)
 		mempool_size = 0x200000;
 		skip_net_init = 1;
-		delayed_net_init = 1;
 	}else if (strncmp(titleid, "PCSF00485", 9) == 0){ // Ratchet and Clank 2 (EUR)
 		mempool_size = 0x200000;
 	}else if (strncmp(titleid, "PCSF00486", 9) == 0){ // Ratchet and Clank 3 (EUR)
@@ -442,8 +582,11 @@ int module_start(SceSize argc, const void *args) {
 		audio_skt[i] = -1;
 	}
 	
-	// Mutex for asynchronous streaming triggering
-	async_mutex = sceKernelCreateSema("async_mutex", 0, 0, 1, NULL);
+	// Semaphores for asynchronous streaming:
+	// async_run - start gate (initial 1: thread enters, then blocks)
+	// async_frame_sema - one presented frame handed to the thread (max 1 queued)
+	async_run = sceKernelCreateSema("v2r_async_run", 0, 1, 1, NULL);
+	async_frame_sema = sceKernelCreateSema("v2r_async_frame", 0, 0, 1, NULL);
 	
 	// Starting secondary thread for asynchronous streaming
 	stream_thread_id = sceKernelCreateThread("stream_thread", stream_thread, 0xA0, 0x100000, 0, 0, NULL);
@@ -470,9 +613,11 @@ int module_start(SceSize argc, const void *args) {
 int module_stop(SceSize argc, const void *args) {
 	
 	// Freeing encoder and net related stuffs
-	if (!firstBoot){
+	if (backend_ready){
 		if (!isEncoderUnavailable) encoderTerm(&jpeg_encoder);
 		if (isNetAvailable){
+			if (tcp_skt >= 0) sceNetSocketClose(tcp_skt);
+			tcp_skt = -1;
 			sceNetSocketClose(stream_skt);
 			int i;
 			for (i = 0; i < AUDIO_CHANNELS; i++){

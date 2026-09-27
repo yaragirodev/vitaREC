@@ -1,8 +1,8 @@
 #include <psp2/types.h>
 #include <psp2/display.h>
-#include <libk/stdio.h>
-#include <libk/stdarg.h>
-#include <libk/string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
 #include "font.h"
 
 uint32_t* vram32;

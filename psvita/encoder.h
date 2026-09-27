@@ -1,7 +1,7 @@
 #ifndef _ENCODER_H_
 #define _ENCODER_H_
 
-#include <libk/stdlib.h>
+#include <stdlib.h>
 #include <psp2/jpegenc.h>
 
 typedef struct encoder{
